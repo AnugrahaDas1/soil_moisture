@@ -1,0 +1,280 @@
+// Define AOI, time range, and other parameters
+var aoi = geometry; // Define your AOI geometry here
+var startDate = '2016-01-01';
+var endDate = '2020-12-31';
+var speckleFilterSize = 15; 
+var resampleSize = 20; // Optional resampling to coarser resolution
+var polr = "VV"
+
+
+// Filter Sentinel-1 GRD data based on predefined parameters
+var s1Collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(geometry)
+  .filterDate(startDate, endDate)
+  //.filter(ee.Filter.eq('resolution', 'H'))
+  //.filterMetadata("instrumentMode","equals","IW")
+  //.filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV')); // Example for VV polarization
+  
+//print(s1Collection);
+
+// To choose the orbit mode
+var frequency = ee.Dictionary(s1Collection.aggregate_histogram('orbitProperties_pass'));
+//print("frequency of ascending and desending orbital passes", frequency);
+var orbitMode = 'DESCENDING';
+s1Collection  = s1Collection.filter(ee.Filter.eq('orbitProperties_pass', orbitMode));
+
+// To choose the relative orbits
+var relativeOrbits = s1Collection.aggregate_array("relativeOrbitNumber_stop").distinct();
+//print(relativeOrbits);
+var relativeOrbit = 11; // from 1 to 175 and takes approximately 12 days to complete for Sentinel-1A and Sentinel-1B combined
+s1Collection = s1Collection.filter(ee.Filter.eq('relativeOrbitNumber_stop', relativeOrbit));
+
+//print(s1Collection);
+
+//////////// Define the necessary functions for border noise removal
+
+//(mask out angles >= 45.23993)
+var maskAngLT452 = function(image) {
+ var ang = image.select(['angle']);
+ return image.updateMask(ang.lt(45.23993)).set('system:time_start', image.get('system:time_start'));
+};
+
+
+// Function to mask out edges of images using angle. (mask out angles <= 30.63993)
+var maskAngGT30 = function(image) {
+ var ang = image.select(['angle']);
+ return image.updateMask(ang.gt(30.63993)).set('system:time_start', image.get('system:time_start'));
+};
+
+
+//Remove edges
+var maskEdge = function(image) {
+  var mask = image.select(0).unitScale(-25, 5).multiply(255).toByte();
+  return image.updateMask(mask.select(0)).set('system:time_start', image.get('system:time_start'));  
+};
+
+
+var f_mask_edges = function(image) {
+  var output = maskAngGT30(image);
+  output = maskAngLT452(output);
+  return output;
+};
+
+var border_noise_removal = function(collection) {
+  return collection.map(f_mask_edges);
+};
+
+// Applying to the s1Collection is your Sentinel-1 ImageCollection
+var borderNoiseRemovedCollection = border_noise_removal(s1Collection);
+
+// Visualize the first image to check the effect of border noise removal
+//Map.addLayer(borderNoiseRemovedCollection.first(), {bands: 'VV', min: -25, max: 0}, '1Border Noise Removed');
+
+
+///////////////////Terrain Flattening
+
+// Correction function for radiometric slope correction on a Sentinel-1 image collection.
+var slope_correction = function (collection, options) {
+    // Set default options if undefined
+    options = options || {};
+    var model = options.model || 'volume'; // Default correction model ('volume', 'surface', 'direct')
+    var elevation = options.elevation || ee.Image('NASA/NASADEM_HGT/001'); // Default elevation model (SRTM) or USGS/SRTMGL1_003
+    var buffer = options.buffer || 0; // Buffer distance in meters for edge erosion to reduce edge effects (default is 0, no buffer)
+    var selected_band = options.selected_band || 'VV'; // Default radar band for correction ('VV' or 'VH')
+
+    // 90 degrees in radians for calculations
+    var ninetyRad = ee.Image.constant(90).multiply(Math.PI / 180);
+
+    // Correction models
+    // Volumetric Model (Hoekman 1990): Assumes volume scattering (e.g., vegetation)
+    function _volume_model(theta_iRad, alpha_rRad) {
+        var nominator = ninetyRad.subtract(theta_iRad).add(alpha_rRad).tan();
+        var denominator = ninetyRad.subtract(theta_iRad).tan();
+        return nominator.divide(denominator);
+    }
+
+    // Surface Model (Ulander et al. 1996): Assumes surface scattering
+    function _surface_model(theta_iRad, alpha_rRad, alpha_azRad) {
+        var nominator = ninetyRad.subtract(theta_iRad).cos();
+        var denominator = alpha_azRad.cos().multiply(ninetyRad.subtract(theta_iRad).add(alpha_rRad).cos());
+        return nominator.divide(denominator);
+    }
+
+    // Erosion function to reduce edge effects by applying a buffer
+    function _erode(img, distance) {
+        var d = img.not().unmask(1).fastDistanceTransform(30).sqrt().multiply(ee.Image.pixelArea().sqrt());
+        return img.updateMask(d.gt(distance));
+    }
+
+    // Masking function for layover and shadow
+    function _masking(alpha_rRad, theta_iRad, proj, buffer) {
+        var layover = alpha_rRad.lt(theta_iRad).rename('layover'); // Layover: where slope > radar viewing angle
+        var shadow = alpha_rRad.gt(ninetyRad.subtract(theta_iRad).multiply(-1)).rename('shadow'); // Shadow
+        var mask = layover.and(shadow); // Combine layover and shadow masks
+
+        if (buffer > 0) mask = _erode(mask, buffer); // Apply buffer if specified
+        return mask.rename('no_data_mask');
+    }
+
+    // Main correction function applied to each image in the collection
+    function _correct(image) {
+        var geom = image.geometry(); // Get image geometry
+        var proj = image.select(0).projection(); // Get image projection
+        var heading = ee.Terrain.aspect(image.select('angle')).reduceRegion(ee.Reducer.mean(), geom, 1000).get('aspect'); // Radar look direction
+
+        var sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0)); // Convert from dB to linear power
+
+        // Radar geometry
+        var theta_iRad = image.select('angle').multiply(Math.PI / 180).clip(geom); // Incidence angle in radians
+        var phi_iRad = ee.Image.constant(heading).multiply(Math.PI / 180); // Radar look direction in radians
+
+        // Terrain geometry
+        var alpha_sRad = ee.Terrain.slope(elevation).select('slope').multiply(Math.PI / 180).setDefaultProjection(proj).clip(geom); // Slope in radians
+        var phi_sRad = ee.Terrain.aspect(elevation).select('aspect').multiply(Math.PI / 180).setDefaultProjection(proj).clip(geom); // Aspect in radians
+
+        var phi_rRad = phi_iRad.subtract(phi_sRad); // Relative azimuth angle
+
+        // Slope steepness in range and azimuth
+        var alpha_rRad = alpha_sRad.tan().multiply(phi_rRad.cos()).atan(); // Slope steepness in range
+        var alpha_azRad = alpha_sRad.tan().multiply(phi_rRad.sin()).atan(); // Slope steepness in azimuth
+
+        var gamma0 = sigma0Pow.divide(theta_iRad.cos()); // Initial gamma0 calculation
+
+        // Apply the selected model to derive the correction factor
+        var corrModel;
+        if (model === 'volume') corrModel = _volume_model(theta_iRad, alpha_rRad);
+        else if (model === 'surface') corrModel = _surface_model(theta_iRad, alpha_rRad, alpha_azRad);
+        // Direct model can be implemented similarly if needed
+
+        var gamma0_flat = gamma0.divide(corrModel); // Apply correction factor
+        var gamma0_flatDB = gamma0_flat.log10().multiply(10.0).select([selected_band]); // Convert back to dB
+
+        var mask = _masking(alpha_rRad, theta_iRad, proj, buffer); // Apply layover and shadow masking
+
+        return gamma0_flatDB.addBands(mask).copyProperties(image).copyProperties(image, ['system:time_start']); // Return corrected image with mask
+    }
+
+    return collection.map(_correct); // Apply correction to each image in the collection
+};
+
+// Apply Terrain Correction
+var correctedCollection = slope_correction(borderNoiseRemovedCollection, {
+  model: 'volume', // Use the volumetric model for correction
+  elevation: ee.Image('NASA/NASADEM_HGT/001'), // Using SRTM as elevation model
+  selected_band: polr // Assuming you're working with the VV polarization
+});
+
+//print(correctedCollectionVH)
+// Check the results by visualizing the first corrected image
+//Map.addLayer(correctedCollectionVV.first(), {bands: 'VV', min: -25, max: 0}, '2Slope Corrected');
+
+/*/ Combine 'VV' and 'VH' bands from the separate collections
+var combinedCollection = correctedCollectionVV.map(function(imageVV) {
+  var date = imageVV.date(); // Get the date of the current 'VV' image
+  var imageVH = correctedCollectionVH.filterDate(date, date.advance(1, 'day')).first(); // Find the corresponding 'VH' image by date
+  return imageVV.addBands(imageVH.select('VH')); // Add the 'VH' band to the 'VV' image
+});
+//print(combinedCollection)
+*/
+
+
+
+function toNatural(img) {
+    // Convert 'VV' and 'VH' from dB to natural scale
+    var vvNatural = ee.Image(10).pow(img.select('VV').divide(10.0)).rename('VV');
+    var vhNatural = ee.Image(10).pow(img.select('VH').divide(10.0)).rename('VH');
+    
+    // Combine the converted 'VV' and 'VH' bands with the 'angle' band
+    return img.addBands(vvNatural, null, true) // The true parameter replaces the 'VV' band with vvNatural
+               .addBands(vhNatural, null, true) // The true parameter replaces the 'VH' band with vhNatural
+               .copyProperties(img, img.propertyNames());
+}
+
+
+// From dB to Natural Scale
+var naturalScaleCollection = combinedCollection.map(toNatural);
+//print(naturalScaleCollection)
+//Map.addLayer(naturalScaleCollection.first(), {bands: 'VV', min: -25, max: 0}, '3Natural Scale');
+
+
+/////////////Apply Speckle Filtering
+function filter_img(img) {
+    var minMax =  ee.Terrain.aspect(img.select('angle')).reduceRegion(ee.Reducer.mean(), img.geometry(), 1000);
+    return img.set({
+      roi_mean: minMax.get('aspect')
+    });
+}
+
+// MEDIAN FILTER
+var filterSpeckles = function(img) {
+  var smoothed = img.focal_median(specklefilterSize,'square','meters'); 
+  return smoothed.copyProperties(img).copyProperties(img, ['system:time_start']);
+};
+
+
+var specklefilterSize = 30; // Example size in meters, adjust as needed
+
+var speckleFilteredCollection = naturalScaleCollection.map(filterSpeckles);
+
+
+//Map.addLayer(speckleFilteredCollection.first(), {bands: 'VV', min: -25, max: 0}, '4Speckle Filtered');
+
+
+//print(speckleFilteredCollection)
+
+
+
+    // RESAMPLE TO NEW PIXEL SIZE
+var epsg = speckleFilteredCollection.first().select(0).projection().crs();
+
+var resample = function(image) {
+  var resampled = image.resample("bilinear")
+  .reproject({crs: epsg, scale: resampleSize});
+  
+return resampled;
+};
+
+var resampleCollection = speckleFilteredCollection.map(resample)
+
+
+
+function toDB(img) {
+    // Convert 'VV' and 'VH' from natural scale to dB scale
+    var vvDB = img.select('VV').log10().multiply(10.0).rename('VV');
+    var vhDB = img.select('VH').log10().multiply(10.0).rename('VH');
+    
+    // Combine the converted 'VV' and 'VH' bands with the 'angle' band
+    return img.addBands(vvDB, null, true) // The true parameter replaces the 'VV' band with vvDB
+               .addBands(vhDB, null, true) // The true parameter replaces the 'VH' band with vhDB
+               .copyProperties(img, img.propertyNames());
+}
+
+
+// Convert back to dB scale after terrain correction
+var dBConvertedCollection = resampleCollection.map(toDB);
+
+//Map.addLayer(dBConvertedCollection.first(), {bands: 'VV', min: -25, max: 0}, '5 dB scale');
+
+var bands = dBConvertedCollection.select('VV','VH')
+
+
+var timeSeriesChart = ui.Chart.image.series({
+    imageCollection: dBConvertedCollection.select(['VV', 'VH']),
+    region: geometry,
+    reducer: ee.Reducer.mean(),
+    scale: 20,
+    xProperty: 'system:time_start'
+}).setOptions({
+    title: 'Mean dB Values over Time',
+    vAxis: {title: 'dB'},
+    hAxis: {title: 'Date'},
+    lineWidth: 2,  // Set line width to make lines visible
+    pointsVisible: false,
+    series: {
+        0: {color: 'blue', label: 'VV'},  // Style for 'VV' band series
+        1: {color: 'green', label: 'VH'}  // Style for 'VH' band series
+    }
+});
+
+// Print the chart to the console
+print(timeSeriesChart);
